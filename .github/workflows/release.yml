@@ -1,0 +1,31 @@
+name: Build and Release DisplaySaver
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build DisplaySaver (.app, .dmg, .pkg)
+        run: |
+          chmod +x build.sh package.sh
+          ./package.sh
+
+      - name: Upload Release Artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            DisplaySaver-*.dmg
+            DisplaySaver-*-Installer.pkg
+          generate_release_notes: true

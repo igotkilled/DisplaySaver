@@ -1,0 +1,19 @@
+# Personal display profiles & runtime logs (never commit personal monitor UUIDs/serials)
+profiles.json
+events.log
+
+# Compiled bundles & installer artifacts (attached via GitHub Releases instead)
+DisplaySaver.app/
+*.dmg
+*.pkg
+*.zip
+
+# Swift Package Manager & Xcode build artifacts
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserdata
+
+# macOS Finder metadata
+.DS_Store
