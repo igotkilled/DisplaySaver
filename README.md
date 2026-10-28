@@ -20,8 +20,8 @@
 - **Save Up to 5 Custom Setups with Smart Auto-Naming**:
   - Save up to 5 custom display configurations (e.g., mirrored TV setup vs. unmirrored multi-monitor setup).
   - Automatically generates a concise, human-readable layout summary when saving or renaming (e.g., `ULTRAGEAR Left, ULTRAGEAR+ & LG TV Mirrored Right`).
-- **One-Click Bordered Action Buttons (`Preview`, `Edit`, `Apply`)**:
-  - Each saved setup features rounded-box icon buttons in order: **Preview (`👁`)**, **Edit (`✎`)**, and **Apply (`✓`)**—allowing you to either preview a setup's visual diagram before switching or apply a saved configuration immediately in a single click.
+- **One-Click Action Buttons (`Preview`, `Edit`, `Apply`)**:
+  - Each saved setup features icon buttons in order: **Preview (`👁`)**, **Edit (`✎`)**, and **Apply (`✓`)**—allowing you to either preview a setup's visual diagram before switching or apply a saved configuration immediately in a single click.
   - Includes Xcode-style floating hover tooltips that display full setup names and button actions without shifting the UI.
 - **macOS 27.2 & Idle Sleep Stability Fixes**:
   - Moved runtime profile and log storage exclusively to `~/Library/Application Support/DisplaySaver` to prevent macOS `FileProvider` / TCC launch hangs.
