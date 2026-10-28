@@ -1,12 +1,21 @@
 import SwiftUI
 
-/// Visual miniature diagram of the display arrangement, showing relative positions, dimensions, main display, and mirroring.
-/// When `manager.isEditingLayout` is true, allows dragging displays interactively to rearrange them!
+/// Visual miniature diagram of a display arrangement, showing relative positions, dimensions, main display, and mirroring.
+/// Can be used either for the live/editable display canvas OR as a static preview when clicking a saved setup!
 struct DisplayLayoutPreview: View {
     @ObservedObject var manager: DisplayManager
+    var overrideDisplays: [DisplayConfig]? = nil
+    var isPreviewCard: Bool = false
+
+    private var isInteractiveEditor: Bool {
+        overrideDisplays == nil && manager.isEditingLayout
+    }
 
     private var activeDisplays: [DisplayConfig] {
-        manager.isEditingLayout ? manager.editingDisplays : manager.currentDisplays
+        if let overrideDisplays {
+            return overrideDisplays
+        }
+        return manager.isEditingLayout ? manager.editingDisplays : manager.currentDisplays
     }
 
     private var nonMirroredDisplays: [DisplayConfig] {
@@ -30,7 +39,7 @@ struct DisplayLayoutPreview: View {
                 let totalWidth = max(maxX - minX, 1)
                 let totalHeight = max(maxY - minY, 1)
 
-                let padding: CGFloat = manager.isEditingLayout ? 24 : 14
+                let padding: CGFloat = isInteractiveEditor ? 22 : 14
                 let availW = max(geo.size.width - padding * 2, 10)
                 let availH = max(geo.size.height - padding * 2, 10)
                 let scale = min(availW / totalWidth, availH / totalHeight)
@@ -47,51 +56,80 @@ struct DisplayLayoutPreview: View {
                         let baseX = offsetX + (CGFloat(disp.originX) - minX) * scale
                         let baseY = offsetY + (CGFloat(disp.originY) - minY) * scale
 
-                        let isDraggingThis = manager.isEditingLayout && manager.draggingDisplayUUID == disp.uuid
+                        let isDraggingThis = isInteractiveEditor && manager.draggingDisplayUUID == disp.uuid
                         let dragX = isDraggingThis ? manager.dragTranslation.width : 0
                         let dragY = isDraggingThis ? manager.dragTranslation.height : 0
 
                         let mirroredPeers = activeDisplays.filter { $0.mirrorsUUID == disp.uuid }
+                        let isSelectedInEditor = isInteractiveEditor && (
+                            manager.selectedEditingDisplayUUID == disp.uuid ||
+                            mirroredPeers.contains(where: { $0.uuid == manager.selectedEditingDisplayUUID })
+                        )
 
                         ZStack {
-                            RoundedRectangle(cornerRadius: 5)
-                                .fill(disp.isMain ? Color.accentColor.opacity(0.25) : Color.secondary.opacity(0.20))
-                            RoundedRectangle(cornerRadius: 5)
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(disp.isMain ? Color.accentColor.opacity(0.26) : Color.secondary.opacity(0.20))
+                            RoundedRectangle(cornerRadius: 6)
                                 .strokeBorder(
-                                    isDraggingThis ? Color.orange : (disp.isMain ? Color.accentColor : Color.secondary.opacity(0.7)),
+                                    isDraggingThis ? Color.orange : (
+                                        isSelectedInEditor ? Color.cyan : (
+                                            disp.isMain ? Color.accentColor : Color.secondary.opacity(0.75)
+                                        )
+                                    ),
                                     style: StrokeStyle(
-                                        lineWidth: (disp.isMain || isDraggingThis) ? 2.0 : 1.2,
-                                        dash: (manager.isEditingLayout && !disp.isMain) ? [4, 2] : []
+                                        lineWidth: (disp.isMain || isDraggingThis || isSelectedInEditor) ? 2.2 : 1.2,
+                                        dash: (isInteractiveEditor && !disp.isMain && !isSelectedInEditor) ? [4, 2] : []
                                     )
                                 )
 
-                            VStack(spacing: 1) {
+                            VStack(spacing: 1.5) {
                                 // Simulated menu bar on the Main display
                                 if disp.isMain {
                                     Rectangle()
-                                        .fill(Color.accentColor.opacity(0.8))
-                                        .frame(height: 3)
-                                        .padding(.horizontal, 3)
+                                        .fill(Color.accentColor.opacity(0.85))
+                                        .frame(height: 3.5)
+                                        .padding(.horizontal, 4)
                                         .padding(.top, 2)
                                 }
                                 Spacer(minLength: 0)
                                 Text(disp.name)
-                                    .font(.system(size: 9, weight: .semibold))
+                                    .font(.system(size: 9.5, weight: .bold))
                                     .lineLimit(1)
-                                    .minimumScaleFactor(0.7)
-                                    .padding(.horizontal, 3)
-                                Text("\(disp.width)×\(disp.height)")
+                                    .minimumScaleFactor(0.65)
+                                    .padding(.horizontal, 4)
+
+                                let hzText = disp.refreshRate > 0 ? " @ \(Int(disp.refreshRate.rounded()))Hz" : ""
+                                Text("\(disp.width)×\(disp.height)\(hzText)")
                                     .font(.system(size: 8))
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.7)
+
                                 if !mirroredPeers.isEmpty {
-                                    Text("+ \(mirroredPeers.map { $0.name }.joined(separator: ", ")) (Mirror)")
-                                        .font(.system(size: 7.5, weight: .medium))
-                                        .foregroundStyle(.orange)
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.6)
-                                        .padding(.horizontal, 2)
+                                    ForEach(mirroredPeers) { peer in
+                                        let peerSelected = isInteractiveEditor && manager.selectedEditingDisplayUUID == peer.uuid
+                                        Button {
+                                            if isInteractiveEditor {
+                                                manager.selectedEditingDisplayUUID = peer.uuid
+                                            }
+                                        } label: {
+                                            Text("+ \(peer.name) (Mirror)")
+                                                .font(.system(size: 7.5, weight: .semibold))
+                                                .foregroundStyle(peerSelected ? .white : .orange)
+                                                .padding(.horizontal, 4)
+                                                .padding(.vertical, 1)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(peerSelected ? Color.orange : Color.orange.opacity(0.16))
+                                                )
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.6)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
                                 }
-                                if manager.isEditingLayout {
+
+                                if isInteractiveEditor || isPreviewCard {
                                     Text("(\(disp.originX), \(disp.originY))")
                                         .font(.system(size: 7, design: .monospaced))
                                         .foregroundStyle(.secondary)
@@ -102,16 +140,22 @@ struct DisplayLayoutPreview: View {
                         .frame(width: w, height: h)
                         .shadow(color: isDraggingThis ? .black.opacity(0.35) : .clear, radius: 5)
                         .position(x: baseX + w / 2.0 + dragX, y: baseY + h / 2.0 + dragY)
-                        .zIndex(isDraggingThis ? 10 : 1)
+                        .zIndex(isDraggingThis ? 10 : (isSelectedInEditor ? 5 : 1))
+                        .onTapGesture {
+                            if isInteractiveEditor {
+                                manager.selectedEditingDisplayUUID = disp.uuid
+                            }
+                        }
                         .gesture(
                             DragGesture(minimumDistance: 2)
                                 .onChanged { value in
-                                    guard manager.isEditingLayout else { return }
+                                    guard isInteractiveEditor else { return }
+                                    manager.selectedEditingDisplayUUID = disp.uuid
                                     manager.draggingDisplayUUID = disp.uuid
                                     manager.dragTranslation = value.translation
                                 }
                                 .onEnded { value in
-                                    guard manager.isEditingLayout else { return }
+                                    guard isInteractiveEditor else { return }
                                     let deltaDisplayX = value.translation.width / max(scale, 0.0001)
                                     let deltaDisplayY = value.translation.height / max(scale, 0.0001)
                                     manager.draggingDisplayUUID = nil
@@ -127,14 +171,17 @@ struct DisplayLayoutPreview: View {
                 }
             }
         }
-        .frame(height: manager.isEditingLayout ? 115 : 92)
+        .frame(height: isInteractiveEditor ? 120 : (isPreviewCard ? 110 : 96))
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.75))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(manager.isEditingLayout ? Color.accentColor.opacity(0.8) : Color.secondary.opacity(0.2), lineWidth: manager.isEditingLayout ? 1.5 : 1)
+                .strokeBorder(
+                    (isInteractiveEditor || isPreviewCard) ? Color.accentColor.opacity(0.85) : Color.secondary.opacity(0.25),
+                    lineWidth: (isInteractiveEditor || isPreviewCard) ? 1.5 : 1
+                )
         )
     }
 }

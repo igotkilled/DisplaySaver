@@ -4,15 +4,28 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
+    static var shared: AppDelegate?
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var mainWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
+    private var didSetupUI = false
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
         if Self.ensureRunningFromApplicationsFolder() {
             return
         }
+        setupUIIfNeeded()
+    }
+
+    func setupUIIfNeeded() {
+        guard !didSetupUI else { return }
+        didSetupUI = true
         let manager = DisplayManager.shared
         let loginManager = LaunchAtLoginManager.shared
 
@@ -35,11 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         self.statusItem = item
 
         // Configure popover for single-clicking the menu bar item
-        popover.contentSize = NSSize(width: 350, height: 480)
+        popover.contentSize = NSSize(width: 468, height: 640)
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
+        let popoverHosting = NSHostingController(
             rootView: MenuBarView(
                 manager: manager,
                 loginManager: loginManager,
@@ -49,13 +62,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 }
             )
         )
+        popover.contentViewController = popoverHosting
 
-        // Reactively update the status bar icon when state changes
+        // Reactively update the status bar icon and window size when state changes
         manager.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self = self, let button = self.statusItem?.button else { return }
-                self.updateStatusButton(button, manager: manager)
+                guard let self = self else { return }
+                if let button = self.statusItem?.button {
+                    self.updateStatusButton(button, manager: manager)
+                }
+                self.adjustWindowHeightIfNeeded(manager: manager)
             }
             .store(in: &cancellables)
 
@@ -132,25 +149,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 468, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "DisplaySaver"
-        window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentViewController = NSHostingController(
+        let hosting = NSHostingController(
             rootView: MenuBarView(
                 manager: DisplayManager.shared,
                 loginManager: LaunchAtLoginManager.shared,
                 onOpenDashboardWindow: nil
             )
         )
+        window.contentViewController = hosting
+        window.minSize = NSSize(width: 468, height: 560)
+        window.setContentSize(NSSize(width: 468, height: 640))
+        window.center()
         self.mainWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func adjustWindowHeightIfNeeded(manager: DisplayManager) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let needsExpanded = manager.isEditingLayout || manager.previewingProfileID != nil
+            let targetHeight: CGFloat = needsExpanded ? 760 : 640
+            self.popover.contentSize = NSSize(width: 468, height: targetHeight)
+            if let window = self.mainWindow {
+                var frame = window.frame
+                let currentContentH = window.contentRect(forFrameRect: frame).height
+                if needsExpanded && currentContentH < 740 {
+                    let delta = targetHeight - currentContentH
+                    frame.origin.y -= delta
+                    frame.size.height += delta
+                    if frame.size.width < 468 {
+                        frame.size.width = 468
+                    }
+                    window.setFrame(frame, display: true, animate: true)
+                }
+            }
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -161,36 +203,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
     }
 
-    /// Ensures `/Applications/DisplaySaver.app` is up-to-date and that the running process is the `/Applications/DisplaySaver.app` instance
-    /// (required by macOS 27 Menu Bar & Bartender 7). Also watches the workspace build for changes and hot-reloads `/Applications/DisplaySaver.app` automatically!
+    /// Ensures `/Applications/DisplaySaver.app` is used when launched from Downloads/Documents without blocking main thread on iCloud Drive I/O.
     private static func ensureRunningFromApplicationsFolder() -> Bool {
-        let workspaceBundleURL = URL(fileURLWithPath: "/Users/jamessavoie/Documents/mac display saver/DisplaySaver.app").standardizedFileURL
         let appsBundleURL = URL(fileURLWithPath: "/Applications/DisplaySaver.app").standardizedFileURL
         let currentBundleURL = Bundle.main.bundleURL.standardizedFileURL
-        let fm = FileManager.default
 
-        let workspaceExec = workspaceBundleURL.appendingPathComponent("Contents/MacOS/DisplaySaver")
+        // If we are ALREADY running from /Applications/DisplaySaver.app, never touch iCloud Drive!
+        if currentBundleURL.path == appsBundleURL.path {
+            return false
+        }
+
+        let fm = FileManager.default
         let appsExec = appsBundleURL.appendingPathComponent("Contents/MacOS/DisplaySaver")
 
-        let workspaceMod = (try? fm.attributesOfItem(atPath: workspaceExec.path)[.modificationDate] as? Date) ?? .distantPast
-        let appsMod = (try? fm.attributesOfItem(atPath: appsExec.path)[.modificationDate] as? Date) ?? .distantPast
-
-        // Copy workspace bundle to /Applications if /Applications is missing or older
-        if fm.fileExists(atPath: workspaceExec.path) && (!fm.fileExists(atPath: appsExec.path) || workspaceMod > appsMod) {
-            try? fm.removeItem(at: appsBundleURL)
-            try? fm.copyItem(at: workspaceBundleURL, to: appsBundleURL)
-        } else if currentBundleURL.path != appsBundleURL.path && !currentBundleURL.path.hasPrefix("/Volumes/") {
-            // For general users launching from ~/Downloads or ~/Desktop, install into /Applications automatically
+        if !currentBundleURL.path.hasPrefix("/Volumes/") {
             let curExec = currentBundleURL.appendingPathComponent("Contents/MacOS/DisplaySaver")
             let curMod = (try? fm.attributesOfItem(atPath: curExec.path)[.modificationDate] as? Date) ?? Date()
+            let appsMod = (try? fm.attributesOfItem(atPath: appsExec.path)[.modificationDate] as? Date) ?? .distantPast
             if !fm.fileExists(atPath: appsExec.path) || curMod > appsMod {
                 try? fm.removeItem(at: appsBundleURL)
                 try? fm.copyItem(at: currentBundleURL, to: appsBundleURL)
             }
         }
 
-        // If we were launched from the workspace (not /Applications), launch the /Applications copy and terminate this one!
-        if currentBundleURL.path != appsBundleURL.path && fm.fileExists(atPath: appsExec.path) {
+        if fm.fileExists(atPath: appsExec.path) {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
             NSWorkspace.shared.openApplication(at: appsBundleURL, configuration: config) { _, _ in
@@ -200,28 +236,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             }
             return true
         }
-
-        // We ARE running from /Applications/DisplaySaver.app!
-        // Start a lightweight watcher so whenever a new build is compiled in the workspace,
-        // /Applications/DisplaySaver.app automatically updates and relaunches itself!
-        let initialMod = (try? fm.attributesOfItem(atPath: appsExec.path)[.modificationDate] as? Date) ?? Date()
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-            let fileMgr = FileManager.default
-            guard let latestWorkspaceMod = (try? fileMgr.attributesOfItem(atPath: workspaceExec.path)[.modificationDate] as? Date),
-                  latestWorkspaceMod > initialMod.addingTimeInterval(1.0) else {
-                return
-            }
-            try? fileMgr.removeItem(at: appsBundleURL)
-            if (try? fileMgr.copyItem(at: workspaceBundleURL, to: appsBundleURL)) != nil {
-                let task = Process()
-                task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                task.arguments = ["-n", appsBundleURL.path]
-                try? task.run()
-                DispatchQueue.main.async {
-                    NSApp.terminate(nil)
-                }
-            }
-        }
         return false
     }
 }
@@ -229,6 +243,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 @main
 struct DisplaySaverApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    init() {
+        // Ensure UI setup & display monitoring always start on the next main runloop tick
+        // even if macOS 27.2 delays or skips SwiftUI Settings-only lifecycle callbacks.
+        DispatchQueue.main.async {
+            AppDelegate.shared?.setupUIIfNeeded()
+        }
+    }
 
     var body: some Scene {
         Settings {

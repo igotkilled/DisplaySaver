@@ -13,14 +13,15 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 
 echo "Compiling ${APP_NAME}..."
 rm -rf "${TMP_BUILD}"
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${TMP_BUILD}/Sources"
-cp -R Sources/DisplaySaver "${TMP_BUILD}/Sources/"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${TMP_BUILD}/Sources/DisplaySaver"
+cp Sources/DisplaySaver/*.swift "${TMP_BUILD}/Sources/DisplaySaver/"
 xattr -cr "${TMP_BUILD}/Sources" || true
 
 swiftc \
     -O \
+    -parse-as-library \
     -module-cache-path /tmp/swift-module-cache \
-    -target arm64-apple-macosx13.0 \
+    -target arm64-apple-macosx14.0 \
     -framework AppKit \
     -framework SwiftUI \
     -framework CoreGraphics \
@@ -36,8 +37,6 @@ fi
 
 xattr -cr "${TMP_BUNDLE}" || true
 
-# Automatically pick up Developer ID Application or Apple Development certificate if available in Keychain,
-# falling back to ad-hoc signing ("-") on CI or machines without an Apple Developer certificate.
 SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 if [ -z "${SIGN_IDENTITY}" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -n 1 | awk '{print $2}' || true)
