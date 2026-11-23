@@ -32,29 +32,56 @@ struct DisplayLayoutPreview: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 let minX = items.map { CGFloat($0.originX) }.min() ?? 0
-                let minY = items.map { CGFloat($0.originY) }.min() ?? 0
                 let maxX = items.map { CGFloat($0.originX) + CGFloat(max($0.width, 1)) }.max() ?? 1920
-                let maxY = items.map { CGFloat($0.originY) + CGFloat(max($0.height, 1)) }.max() ?? 1080
-
                 let totalWidth = max(maxX - minX, 1)
-                let totalHeight = max(maxY - minY, 1)
 
-                let padding: CGFloat = isInteractiveEditor ? 22 : 14
-                let availW = max(geo.size.width - padding * 2, 10)
-                let availH = max(geo.size.height - padding * 2, 10)
-                let scale = min(availW / totalWidth, availH / totalHeight)
+                let baseMaxH = items.map { CGFloat(max($0.height, 1)) }.max() ?? 1440
+                let mainOriginY = items.first(where: { $0.isMain })?.originY ?? 0
+                let maxAbsOffsetY = items.map { abs(CGFloat($0.originY - mainOriginY)) }.max() ?? 0
+                let isVerticallyStacked = maxAbsOffsetY >= baseMaxH * 0.75
+
+                let padX: CGFloat = isInteractiveEditor ? 20 : 14
+                let padY: CGFloat = isInteractiveEditor ? 14 : 10
+                let availW = max(geo.size.width - padX * 2, 10)
+                let availH = max(geo.size.height - padY * 2, 10)
+
+                // Keep monitor box scale constant during desk-height alignment so rectangles NEVER shrink or smoosh together!
+                let minY = items.map { CGFloat($0.originY) }.min() ?? 0
+                let maxY = items.map { CGFloat($0.originY) + CGFloat(max($0.height, 1)) }.max() ?? 1080
+                let stackedTotalH = max(maxY - minY, 1)
+
+                let scale: CGFloat = isVerticallyStacked
+                    ? min(availW / totalWidth, availH / stackedTotalH)
+                    : min(availW / totalWidth, (availH * 0.66) / baseMaxH)
 
                 let renderedW = totalWidth * scale
-                let renderedH = totalHeight * scale
                 let offsetX = (geo.size.width - renderedW) / 2.0
-                let offsetY = (geo.size.height - renderedH) / 2.0
+                let centerY = geo.size.height / 2.0
+                let visualVerticalMultiplier: CGFloat = 3.2
 
                 ZStack(alignment: .topLeading) {
                     ForEach(items) { disp in
                         let w = max(CGFloat(disp.width) * scale, 28)
                         let h = max(CGFloat(disp.height) * scale, 20)
                         let baseX = offsetX + (CGFloat(disp.originX) - minX) * scale
-                        let baseY = offsetY + (CGFloat(disp.originY) - minY) * scale
+
+                        let boxCenterY: CGFloat = {
+                            if isVerticallyStacked {
+                                let renderedH = stackedTotalH * scale
+                                let offsetY = (geo.size.height - renderedH) / 2.0
+                                return offsetY + (CGFloat(disp.originY) - minY) * scale + h / 2.0
+                            } else if disp.isMain {
+                                return centerY
+                            } else {
+                                // Positive `upPx` (from pressing Up Arrow ↑) moves the selected screen UP in the preview!
+                                let upPx = CGFloat(disp.originY - mainOriginY)
+                                let maxTravel = max((geo.size.height - h) / 2.0 - 6, 4)
+                                let rawShift = -upPx * scale * visualVerticalMultiplier
+                                let clampedShift = min(max(rawShift, -maxTravel), maxTravel)
+                                return centerY + clampedShift
+                            }
+                        }()
+                        let baseY = boxCenterY - h / 2.0
 
                         let isDraggingThis = isInteractiveEditor && manager.draggingDisplayUUID == disp.uuid
                         let dragX = isDraggingThis ? manager.dragTranslation.width : 0
@@ -129,10 +156,17 @@ struct DisplayLayoutPreview: View {
                                     }
                                 }
 
-                                if isInteractiveEditor || isPreviewCard {
-                                    Text("(\(disp.originX), \(disp.originY))")
-                                        .font(.system(size: 7, design: .monospaced))
-                                        .foregroundStyle(.secondary)
+                                if isInteractiveEditor || isPreviewCard || (!disp.isMain && disp.originY != 0) {
+                                    let upPx = Int(disp.originY - mainOriginY)
+                                    let heightNote: String = {
+                                        guard !disp.isMain && upPx != 0 else { return "" }
+                                        return upPx > 0 ? " • +\(upPx)px↑" : " • \(upPx)px↓"
+                                    }()
+                                    Text("(\(disp.originX), \(disp.originY))\(heightNote)")
+                                        .font(.system(size: 7, weight: (!disp.isMain && upPx != 0) ? .semibold : .regular, design: .monospaced))
+                                        .foregroundStyle((!disp.isMain && upPx != 0) ? Color.cyan : .secondary)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.65)
                                 }
                                 Spacer(minLength: 0)
                             }
@@ -157,7 +191,8 @@ struct DisplayLayoutPreview: View {
                                 .onEnded { value in
                                     guard isInteractiveEditor else { return }
                                     let deltaDisplayX = value.translation.width / max(scale, 0.0001)
-                                    let deltaDisplayY = value.translation.height / max(scale, 0.0001)
+                                    let effectiveScaleY = isVerticallyStacked ? scale : (scale * visualVerticalMultiplier)
+                                    let deltaDisplayY = -value.translation.height / max(effectiveScaleY, 0.0001)
                                     manager.draggingDisplayUUID = nil
                                     manager.dragTranslation = .zero
                                     manager.commitDisplayDrag(
@@ -168,10 +203,22 @@ struct DisplayLayoutPreview: View {
                                 }
                         )
                     }
+
+                    // Miniature cyan reference line when Cross-Screen Alignment Ruler is active
+                    if isInteractiveEditor && manager.showAlignmentGuide {
+                        let lineY = centerY
+                        Path { path in
+                            path.move(to: CGPoint(x: offsetX, y: lineY))
+                            path.addLine(to: CGPoint(x: offsetX + renderedW, y: lineY))
+                        }
+                        .stroke(Color.cyan, style: StrokeStyle(lineWidth: 1.5, dash: [4, 2]))
+                        .zIndex(20)
+                        .allowsHitTesting(false)
+                    }
                 }
             }
         }
-        .frame(height: isInteractiveEditor ? 120 : (isPreviewCard ? 110 : 96))
+        .frame(height: isInteractiveEditor ? 132 : (isPreviewCard ? 112 : 102))
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color(nsColor: .controlBackgroundColor).opacity(0.75))

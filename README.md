@@ -1,14 +1,24 @@
-# DisplaySaver for macOS (`v1.1`)
+# DisplaySaver for macOS (`v1.2`)
 
 **DisplaySaver** is a lightweight, native macOS menu bar utility that saves your multi-monitor arrangement, resolutions, refresh rates, scaling (HiDPI), orientations, and mirroring settings—and automatically locks and restores them whenever macOS tries to rearrange your screens on reboot, wake from sleep, or TV/HDMI hotplug events.
 
 ---
 
-## 📸 Screenshots (`v1.1`)
+## 📸 Screenshots
 
 | Main Dashboard & Quick Actions | Setup Preview & Confirmation | Edit Layout & Mirroring |
 | :---: | :---: | :---: |
 | ![Dashboard](docs/screenshots/dashboard-v1.1.png) | ![Setup Preview](docs/screenshots/setup-preview-v1.1.png) | ![Edit Layout & Mirroring](docs/screenshots/edit-layout-mirroring-v1.1.png) |
+
+---
+
+## 🚀 What's New in v1.2
+
+- **App Window Position Restoration**: Automatically saves and restores open app windows (including multiple windows of the same application) back to their assigned displays after a system restart or when display arrangements change.
+- **Cross-Screen Alignment Ruler & Keyboard Nudging**: Added a live on-screen alignment guide and keyboard arrow-key controls (`↑` / `↓` for 1px, `⇧↑` / `⇧↓` for 10px) in **Edit Layout & Mirroring** to fine-tune vertical display alignment across bezels.
+- **Improved Live Layout Preview**: Updated the arrangement preview canvas so vertical display adjustments clearly show each screen moving up or down without rescaling or compressing the display boxes.
+- **Stronger Refresh Rate, Resolution & Mirroring Lock**: Isolated per-display mode transactions and added multi-stage post-wake verification so primary, extended, and mirrored displays reliably maintain their configured resolution, refresh rate, and mirroring state after sleep, wake, or hotplug events.
+- **UI & Background Watchdog Improvements**: Increased the default window height so all controls fit without scrolling, and ensured Edit Mode automatically exits when closed or inactive so background auto-restore is never paused.
 
 ---
 
@@ -31,8 +41,8 @@
 
 ## ✨ Core Features
 
-- **Automatic Display Layout Lock**: Listens to `CoreGraphics` display reconfiguration callbacks, system/screen wake events, and a background watchdog to automatically restore your saved layout if macOS shifts monitor origins, drops refresh rates (e.g., 60Hz → 30Hz on mirrored TVs), or breaks mirroring.
-- **Two-Phase Mirror & Refresh Rate Restoration**: Safely restores hardware mirror sets (ensuring your primary monitor remains the Mirror Master at full refresh rate, such as 240Hz, while locking mirrored TVs/secondary displays to their target 60Hz native mode without triggering CoreGraphics `1010` transaction conflicts).
+- **Automatic Display Layout Lock**: Listens to `CoreGraphics` display reconfiguration callbacks, system/screen wake events, and a background watchdog to automatically restore your saved layout if macOS shifts monitor origins, drops refresh rates, or changes mirroring.
+- **Two-Phase Mirror & Refresh Rate Restoration**: Safely restores hardware mirror sets and per-display refresh rates in isolated transactions without triggering CoreGraphics `1010` transaction conflicts.
 - **HDMI / TV Power-Transition Protection**: Prevents secondary or primary monitors from blanking out when a mirrored TV is turned off or on.
 - **Smart Menu Bar & Dock Integration**:
   - Single-click the menu bar icon (`lock.display`) to open the quick popover.
@@ -47,8 +57,8 @@
 
 ### Option 1: Download Prebuilt Installer (`.dmg` or `.pkg`)
 Download the latest release from the [**Releases**](../../releases) page:
-- **`DisplaySaver-1.1.dmg`** *(Recommended)*: Open the disk image and drag **DisplaySaver.app** into your **Applications** folder.
-- **`DisplaySaver-1.1-Installer.pkg`**: Double-click to run the standard macOS Installer wizard, which installs **DisplaySaver.app** directly into `/Applications`.
+- **`DisplaySaver-1.2.dmg`** *(Recommended)*: Open the disk image and drag **DisplaySaver.app** into your **Applications** folder.
+- **`DisplaySaver-1.2-Installer.pkg`**: Double-click to run the standard macOS Installer wizard, which installs **DisplaySaver.app** directly into `/Applications`.
 
 ### Option 2: Build from Source
 Requires macOS 14.0+ and Xcode Command Line Tools (`swiftc`).

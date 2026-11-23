@@ -9,7 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private let popover = NSPopover()
     private var mainWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
+    private var keyDownMonitor: Any?
     private var didSetupUI = false
+    private var lastNeedsExpanded = false
+    private var lastStatusSymbol = ""
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -48,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         self.statusItem = item
 
         // Configure popover for single-clicking the menu bar item
-        popover.contentSize = NSSize(width: 468, height: 640)
+        popover.contentSize = NSSize(width: 468, height: 720)
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -62,7 +65,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 }
             )
         )
+        if #available(macOS 13.0, *) {
+            popoverHosting.sizingOptions = [.minSize]
+        }
         popover.contentViewController = popoverHosting
+
+        // Install local keyboard monitor for arrow-key screen alignment in Edit Layout & Mirroring
+        if keyDownMonitor == nil {
+            keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                let mgr = DisplayManager.shared
+                guard mgr.isEditingLayout,
+                      mgr.arrowKeyAlignmentEnabled,
+                      !mgr.isCreatingProfile,
+                      mgr.renamingProfileID == nil,
+                      event.window != nil else {
+                    return event
+                }
+                if let responder = event.window?.firstResponder, responder is NSText {
+                    return event
+                }
+                let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                guard mods.isDisjoint(with: [.command, .control, .option]) else {
+                    return event
+                }
+                let step = mods.contains(.shift) ? 10 : 1
+                switch event.keyCode {
+                case 126: // Up Arrow
+                    mgr.handleEditorArrowKey(dx: 0, dyHigher: step)
+                    return nil
+                case 125: // Down Arrow
+                    mgr.handleEditorArrowKey(dx: 0, dyHigher: -step)
+                    return nil
+                case 123: // Left Arrow
+                    mgr.handleEditorArrowKey(dx: -step, dyHigher: 0)
+                    return nil
+                case 124: // Right Arrow
+                    mgr.handleEditorArrowKey(dx: step, dyHigher: 0)
+                    return nil
+                default:
+                    return event
+                }
+            }
+        }
 
         // Reactively update the status bar icon and window size when state changes
         manager.objectWillChange
@@ -100,6 +144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         } else {
             symbolName = "exclamationmark.triangle"
         }
+        guard symbolName != lastStatusSymbol else { return }
+        lastStatusSymbol = symbolName
 
         if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "DisplaySaver")
             ?? NSImage(systemSymbolName: "display", accessibilityDescription: "DisplaySaver") {
@@ -130,14 +176,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            DisplayManager.shared.refreshCurrentDisplays()
+            let mgr = DisplayManager.shared
+            mgr.refreshCurrentDisplays()
+            if mgr.autoEnforceLayout && !mgr.isEditingLayout && !mgr.doesCurrentMatchActiveProfile {
+                mgr.scheduleCheckAndRestore(delay: 0.1)
+            }
+            let needsExpanded = mgr.isEditingLayout || mgr.previewingProfileID != nil
+            popover.contentSize = NSSize(width: 468, height: needsExpanded ? 860 : 720)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
     }
 
     func showMainWindow() {
-        DisplayManager.shared.refreshCurrentDisplays()
+        let mgr = DisplayManager.shared
+        mgr.refreshCurrentDisplays()
+        if mgr.autoEnforceLayout && !mgr.isEditingLayout && !mgr.doesCurrentMatchActiveProfile {
+            mgr.scheduleCheckAndRestore(delay: 0.1)
+        }
 
         // Show the app icon in the macOS Dock whenever the window is open!
         NSApp.setActivationPolicy(.regular)
@@ -149,7 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 468, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 468, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -164,9 +220,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 onOpenDashboardWindow: nil
             )
         )
+        if #available(macOS 13.0, *) {
+            hosting.sizingOptions = [.minSize]
+        }
         window.contentViewController = hosting
-        window.minSize = NSSize(width: 468, height: 560)
-        window.setContentSize(NSSize(width: 468, height: 640))
+        window.minSize = NSSize(width: 468, height: 680)
+        window.setContentSize(NSSize(width: 468, height: 720))
         window.center()
         self.mainWindow = window
         NSApp.activate(ignoringOtherApps: true)
@@ -177,15 +236,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let needsExpanded = manager.isEditingLayout || manager.previewingProfileID != nil
-            let targetHeight: CGFloat = needsExpanded ? 760 : 640
+            guard needsExpanded != self.lastNeedsExpanded else { return }
+            self.lastNeedsExpanded = needsExpanded
+
+            let maxAvailH = (self.mainWindow?.screen ?? NSScreen.main)?.visibleFrame.height ?? 960
+            let targetHeight: CGFloat = needsExpanded ? min(860, maxAvailH - 40) : 720
             self.popover.contentSize = NSSize(width: 468, height: targetHeight)
             if let window = self.mainWindow {
                 var frame = window.frame
                 let currentContentH = window.contentRect(forFrameRect: frame).height
-                if needsExpanded && currentContentH < 740 {
-                    let delta = targetHeight - currentContentH
+                let delta = targetHeight - currentContentH
+                if abs(delta) > 10 {
                     frame.origin.y -= delta
                     frame.size.height += delta
+                    if let vis = window.screen?.visibleFrame, frame.origin.y < vis.minY {
+                        frame.origin.y = vis.minY
+                    }
                     if frame.size.width < 468 {
                         frame.size.width = 468
                     }
@@ -195,11 +261,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
     }
 
-    func windowWillClose(_ notification: Notification) {
-        // When the user clicks the red close button (X), keep DisplaySaver running in the background
-        // and hide the Dock icon!
+    func popoverDidClose(_ notification: Notification) {
+        // Never leave Edit Layout stuck open in the background when the popover closes,
+        // otherwise automatic drift restoration is paused!
         DispatchQueue.main.async {
+            let mgr = DisplayManager.shared
+            if mgr.isEditingLayout {
+                mgr.cancelEditingLayout()
+            }
+            if mgr.autoEnforceLayout && !mgr.doesCurrentMatchActiveProfile {
+                mgr.scheduleCheckAndRestore(delay: 0.2)
+            }
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // When the user clicks the red close button (X), exit Edit Layout so background auto-restore stays active,
+        // hide any alignment ruler, keep DisplaySaver running in the background, and hide the Dock icon!
+        DispatchQueue.main.async {
+            let mgr = DisplayManager.shared
+            if mgr.isEditingLayout {
+                mgr.cancelEditingLayout()
+            }
+            mgr.showAlignmentGuide = false
             NSApp.setActivationPolicy(.accessory)
+            if mgr.autoEnforceLayout && !mgr.doesCurrentMatchActiveProfile {
+                mgr.scheduleCheckAndRestore(delay: 0.2)
+            }
         }
     }
 

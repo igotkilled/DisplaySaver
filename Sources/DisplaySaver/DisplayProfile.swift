@@ -37,7 +37,13 @@ struct DisplayConfig: Codable, Identifiable, Equatable {
         let hz = refreshRate > 0 ? String(format: " @ %.0fHz", refreshRate) : ""
         let rot = rotation != 0 ? String(format: " • %.0f°", rotation) : ""
         let mainBadge = isMain ? " ★ Main" : ""
-        return "\(width)×\(height)\(scaleSuffix)\(hz)\(rot) at (\(originX), \(originY))\(mainBadge)"
+        let heightBadge: String
+        if !isMain && mirrorsUUID == nil && originY != 0 {
+            heightBadge = originY < 0 ? " • \(abs(originY))px Higher" : " • \(abs(originY))px Lower"
+        } else {
+            heightBadge = ""
+        }
+        return "\(width)×\(height)\(scaleSuffix)\(hz)\(rot) at (\(originX), \(originY))\(heightBadge)\(mainBadge)"
     }
 
     /// Concise display name for auto-generated layout summaries (e.g. "ULTRAGEAR+", "ULTRAGEAR", "LG TV").
@@ -89,6 +95,32 @@ enum DisplayRoleSelection: Hashable {
     case mirror(masterUUID: String)
 }
 
+/// Snapshot of an application window's screen assignment and frame so windows can be restored
+/// if macOS moves all apps to a single screen on reboot, wake, or display reconfiguration.
+struct SavedWindowPosition: Codable, Identifiable, Equatable {
+    var id: String { "\(bundleIdentifier)|\(windowNumber ?? 0)|\(windowIndex)|\(windowTitle)" }
+    var bundleIdentifier: String
+    var appName: String
+    /// Unique macOS CGWindowID within the current login session (prevents mixing up multiple windows of the same app, e.g. Vivaldi)
+    var windowNumber: UInt32? = nil
+    var isFullScreen: Bool? = nil
+    var windowTitle: String
+    var windowIndex: Int
+    /// Persistent UUID of the display this window belonged to
+    var displayUUID: String
+    /// Global CoreGraphics / Accessibility coordinates (top-left origin relative to main display)
+    var x: Double
+    var y: Double
+    var width: Double
+    var height: Double
+    /// Normalized coordinates (0...1) within the target display's bounds
+    var relativeX: Double
+    var relativeY: Double
+    var relativeWidth: Double
+    var relativeHeight: Double
+    var capturedAt: Date = Date()
+}
+
 /// A named profile containing the complete multi-monitor layout and settings.
 struct DisplayProfile: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
@@ -96,6 +128,8 @@ struct DisplayProfile: Codable, Identifiable, Equatable {
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
     var displays: [DisplayConfig]
+    /// Saved application window positions associated with this display setup
+    var savedWindows: [SavedWindowPosition]? = nil
 
     /// Sorted signature of display UUIDs in this profile for matching connected hardware sets
     var hardwareSignature: [String] {

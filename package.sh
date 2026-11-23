@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="DisplaySaver"
-VERSION="1.1"
+VERSION="1.2"
 APP_BUNDLE="${APP_NAME}.app"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"
 PKG_NAME="${APP_NAME}-${VERSION}-Installer.pkg"

@@ -18,7 +18,7 @@ struct MenuBarView: View {
                     HStack(spacing: 6) {
                         Text("DisplaySaver")
                             .font(.system(size: 14, weight: .bold))
-                        Text("v1.1")
+                        Text("v1.2")
                             .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
@@ -51,18 +51,25 @@ struct MenuBarView: View {
                 Spacer(minLength: 8)
 
                 Button {
-                    manager.refreshCurrentDisplays()
-                    if let active = manager.activeProfile {
-                        manager.applyProfile(active)
+                    if manager.isEditingLayout {
+                        manager.saveAndApplyEditedLayout()
+                    } else {
+                        manager.refreshCurrentDisplays()
+                        if let active = manager.activeProfile {
+                            manager.applyProfile(active)
+                        }
                     }
                 } label: {
-                    Label("Restore Now", systemImage: "arrow.counterclockwise")
-                        .font(.system(size: 11.5, weight: .semibold))
+                    Label(
+                        manager.isEditingLayout ? "Save & Apply" : "Restore Now",
+                        systemImage: manager.isEditingLayout ? "checkmark.circle.fill" : "arrow.counterclockwise"
+                    )
+                    .font(.system(size: 11.5, weight: .semibold))
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .disabled(manager.activeProfile == nil)
-                .help("Immediately apply the active saved display layout")
+                .disabled(manager.activeProfile == nil && !manager.isEditingLayout)
+                .help(manager.isEditingLayout ? "Save and apply your edited display layout now" : "Immediately apply the active saved display layout")
             }
             .zIndex(50)
 
@@ -71,13 +78,26 @@ struct MenuBarView: View {
                     // MARK: Visual Layout Diagram & Full Interactive Editor
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 6) {
-                            Text(manager.isEditingLayout ? "EDIT DISPLAY SETUP" : "CURRENT DISPLAY ARRANGEMENT")
+                            Text(manager.isEditingLayout ? "EDIT LAYOUT" : "CURRENT DISPLAY ARRANGEMENT")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundStyle(manager.isEditingLayout ? Color.accentColor : .secondary)
 
                             Spacer()
 
                             if manager.isEditingLayout {
+                                if manager.editingDisplays.filter({ $0.mirrorsUUID == nil }).count >= 2 {
+                                    Button {
+                                        manager.showAlignmentGuide.toggle()
+                                    } label: {
+                                        Label("Ruler", systemImage: "ruler")
+                                            .font(.system(size: 10.5, weight: .medium))
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(manager.showAlignmentGuide ? .cyan : nil)
+                                    .controlSize(.small)
+                                    .help("Toggle live cross-screen alignment line across monitors")
+                                }
+
                                 if manager.editingDisplays.contains(where: { $0.mirrorsUUID != nil }) {
                                     Button {
                                         withAnimation(.easeInOut(duration: 0.15)) {
@@ -197,8 +217,8 @@ struct MenuBarView: View {
 
                     Divider()
 
-                    // MARK: Automation Settings
-                    VStack(alignment: .leading, spacing: 8) {
+                    // MARK: Automation & Window Position Settings
+                    VStack(alignment: .leading, spacing: 9) {
                         Toggle(isOn: $manager.autoEnforceLayout) {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Lock & Auto-Restore Active Setup")
@@ -210,6 +230,85 @@ struct MenuBarView: View {
                         }
                         .toggleStyle(.switch)
                         .controlSize(.small)
+
+                        Toggle(isOn: $manager.autoRestoreWindowPositions) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Restore App Windows to Saved Screens")
+                                    .font(.system(size: 12, weight: .medium))
+                                Text("Move apps back to their previous monitor after reboot, wake, or display changes")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                        HStack(spacing: 6) {
+                            let winCount = manager.activeProfile?.savedWindows?.count ?? 0
+                            let screenCount = Set(manager.activeProfile?.savedWindows?.map { $0.displayUUID } ?? []).count
+                            Image(systemName: "macwindow.on.rectangle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                            Text(winCount > 0
+                                 ? "\(winCount) app window(s) saved across \(max(1, screenCount)) screen(s)"
+                                 : "App window positions auto-saved while layout is in sync")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+
+                            Spacer(minLength: 4)
+
+                            Button {
+                                manager.captureWindowPositionsForActiveProfile(silent: false)
+                            } label: {
+                                Label("Save Windows", systemImage: "camera.viewfinder")
+                                    .font(.system(size: 10.5, weight: .medium))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                            .help("Snapshot current screen & position of all open app windows for the active setup")
+
+                            Button {
+                                manager.restoreSavedWindowsForActiveProfile(reason: "Manual restore", silentIfZero: false)
+                            } label: {
+                                Label("Restore Windows", systemImage: "arrow.uturn.backward.square")
+                                    .font(.system(size: 10.5, weight: .medium))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                            .help("Move open apps back to their saved screen positions now")
+                        }
+
+                        if !manager.isAccessibilityTrusted {
+                            HStack(spacing: 8) {
+                                Image(systemName: "hand.raised.fill")
+                                    .foregroundStyle(.orange)
+                                    .font(.system(size: 11))
+                                Text("Grant Accessibility permission once so DisplaySaver can move app windows across screens.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 4)
+                                Button("Grant Access…") {
+                                    manager.requestAccessibilityPermission()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.orange)
+                                .controlSize(.small)
+                                .fixedSize()
+                            }
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Color.orange.opacity(0.12))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .strokeBorder(Color.orange.opacity(0.4), lineWidth: 1)
+                            )
+                        }
 
                         Toggle(isOn: Binding(
                             get: { loginManager.isEnabled },
@@ -292,7 +391,7 @@ struct MenuBarView: View {
         }
         .padding(14)
         .frame(width: 452)
-        .frame(minHeight: manager.isEditingLayout ? 640 : 520)
+        .frame(minHeight: manager.isEditingLayout ? 760 : 650)
     }
 
     // MARK: - Xcode-Style Floating Overlay Tooltip (Zero Layout Shift!)
@@ -407,7 +506,7 @@ struct MenuBarView: View {
                         Spacer(minLength: 0)
                     }
 
-                    // 2. Quick Left/Right placement buttons when display is Extended
+                    // 2. Quick Left/Right placement + Physical Desk Height Alignment when display is Extended
                     if selected.mirrorsUUID == nil && !selected.isMain {
                         HStack(spacing: 8) {
                             Text("Position:")
@@ -437,6 +536,141 @@ struct MenuBarView: View {
                             .controlSize(.small)
 
                             Spacer(minLength: 0)
+                        }
+
+                        // 2b. Physical Desk Height Alignment (fixes cursor/window vertical jump across monitors!)
+                        let currentHigherPx = manager.deskHeightOffset(for: selected)
+                        let heightStatusText: String = {
+                            if currentHigherPx > 0 {
+                                return "+\(currentHigherPx)px Higher ↑"
+                            } else if currentHigherPx < 0 {
+                                return "\(currentHigherPx)px Lower ↓"
+                            } else {
+                                return "Level (0px)"
+                            }
+                        }()
+
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 8) {
+                                Text("Desk Height:")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .frame(width: 82, alignment: .leading)
+
+                                Text(heightStatusText)
+                                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(currentHigherPx == 0 ? Color.secondary : Color.cyan)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(
+                                        Capsule()
+                                            .fill(currentHigherPx == 0 ? Color.secondary.opacity(0.14) : Color.cyan.opacity(0.16))
+                                    )
+
+                                Spacer(minLength: 4)
+
+                                Button {
+                                    manager.showAlignmentGuide.toggle()
+                                } label: {
+                                    Label(
+                                        manager.showAlignmentGuide ? "Hide Line" : "Alignment Line",
+                                        systemImage: "ruler"
+                                    )
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(manager.showAlignmentGuide ? .cyan : .secondary.opacity(0.45))
+                                .controlSize(.small)
+                                .fixedSize()
+                                .help("Show a live cyan alignment line across both monitors so you can match their physical desk height")
+                            }
+
+                            HStack(spacing: 6) {
+                                Text("Lower")
+                                    .font(.system(size: 9.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+
+                                Slider(
+                                    value: Binding(
+                                        get: { Double(currentHigherPx) },
+                                        set: { newVal in
+                                            manager.setEditingDisplayDeskHeightOffset(
+                                                uuid: selected.uuid,
+                                                higherByPixels: Int(newVal.rounded())
+                                            )
+                                        }
+                                    ),
+                                    in: -400...400
+                                )
+                                .controlSize(.small)
+
+                                Text("Higher")
+                                    .font(.system(size: 9.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.leading, 90)
+
+                            HStack(spacing: 4) {
+                                Spacer().frame(width: 85)
+                                Button("-10") {
+                                    manager.nudgeEditingDisplayDeskHeight(uuid: selected.uuid, deltaHigherPixels: -10)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                .help("Move 10px lower (Shift + ↓)")
+
+                                Button("-1") {
+                                    manager.nudgeEditingDisplayDeskHeight(uuid: selected.uuid, deltaHigherPixels: -1)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                .help("Move 1px lower (↓)")
+
+                                Button("0px") {
+                                    manager.setEditingDisplayDeskHeightOffset(uuid: selected.uuid, higherByPixels: 0)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                .disabled(currentHigherPx == 0)
+                                .help("Reset flush with Main display")
+
+                                Button("+1") {
+                                    manager.nudgeEditingDisplayDeskHeight(uuid: selected.uuid, deltaHigherPixels: 1)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                .help("Move 1px higher (↑)")
+
+                                Button("+10") {
+                                    manager.nudgeEditingDisplayDeskHeight(uuid: selected.uuid, deltaHigherPixels: 10)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                .help("Move 10px higher (Shift + ↑)")
+
+                                Spacer(minLength: 4)
+
+                                Button {
+                                    manager.arrowKeyAlignmentEnabled.toggle()
+                                } label: {
+                                    Label(
+                                        manager.arrowKeyAlignmentEnabled ? "Arrow Keys: ON" : "Arrow Keys: OFF",
+                                        systemImage: "keyboard"
+                                    )
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(manager.arrowKeyAlignmentEnabled ? .cyan : nil)
+                                .controlSize(.mini)
+                                .fixedSize()
+                                .help("Use keyboard ↑/↓ arrows for 1px height nudges (Shift+↑/↓ for 10px) and ←/→ for Left/Right")
+                            }
+
+                            if manager.arrowKeyAlignmentEnabled {
+                                Text("Tip: Use keyboard ↑ / ↓ for 1px, ⇧↑ / ⇧↓ for 10px, and ← / → for Left / Right")
+                                    .font(.system(size: 9.5))
+                                    .foregroundStyle(Color.cyan.opacity(0.9))
+                                    .padding(.leading, 90)
+                            }
                         }
                     }
 
@@ -515,6 +749,38 @@ struct MenuBarView: View {
                         .controlSize(.small)
                         .frame(maxWidth: 240, alignment: .leading)
                         Spacer(minLength: 0)
+                    }
+
+                    // Shortcut to align Extended Display height if Main or Mirror tab is currently selected
+                    if (selected.isMain || selected.mirrorsUUID != nil),
+                       let extDisp = manager.editingDisplays.first(where: { !$0.isMain && $0.mirrorsUUID == nil }) {
+                        let extHigherPx = manager.deskHeightOffset(for: extDisp)
+                        HStack(spacing: 8) {
+                            Text("Desk Height:")
+                                .font(.system(size: 11, weight: .medium))
+                                .frame(width: 82, alignment: .leading)
+
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    manager.selectedEditingDisplayUUID = extDisp.uuid
+                                    manager.showAlignmentGuide = true
+                                }
+                            } label: {
+                                Label(
+                                    extHigherPx == 0
+                                        ? "Align \(extDisp.conciseName) Height…"
+                                        : "Align \(extDisp.conciseName) (\(extHigherPx > 0 ? "+\(extHigherPx)px Higher" : "\(extHigherPx)px Lower"))…",
+                                    systemImage: "ruler"
+                                )
+                                .font(.system(size: 10.5, weight: .medium))
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.cyan)
+                            .controlSize(.small)
+                            .help("Select \(extDisp.name) and turn on the live alignment line across your monitors")
+
+                            Spacer(minLength: 0)
+                        }
                     }
                 }
                 .padding(10)
@@ -1079,6 +1345,8 @@ struct MenuBarView: View {
         }
         if manager.doesCurrentMatchActiveProfile {
             return "Locked to '\(active.name)' • In Sync"
+        } else if manager.autoEnforceLayout && !manager.isEditingLayout {
+            return "Auto-Restoring '\(active.name)'..."
         } else {
             return "Drifted from '\(active.name)'"
         }

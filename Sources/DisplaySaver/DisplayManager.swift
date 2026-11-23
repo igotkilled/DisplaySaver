@@ -49,6 +49,12 @@ final class DisplayManager: ObservableObject {
             UserDefaults.standard.set(autoSwitchByHardwareSet, forKey: "autoSwitchByHardwareSet")
         }
     }
+    @Published var autoRestoreWindowPositions: Bool {
+        didSet {
+            UserDefaults.standard.set(autoRestoreWindowPositions, forKey: "autoRestoreWindowPositions")
+        }
+    }
+    @Published var isAccessibilityTrusted: Bool = false
     @Published var statusMessage: String = "Ready"
     @Published var lastRestoredDate: Date?
     @Published var isApplying: Bool = false
@@ -57,7 +63,17 @@ final class DisplayManager: ObservableObject {
     @Published var isSavingEditedAsNew: Bool = false
     @Published var newProfileName: String = ""
     @Published var showActivityLog: Bool = false
-    @Published var isEditingLayout: Bool = false
+    @Published var isEditingLayout: Bool = false {
+        didSet {
+            AlignmentGuideWindowController.shared.syncVisibility(manager: self)
+        }
+    }
+    @Published var showAlignmentGuide: Bool = false {
+        didSet {
+            AlignmentGuideWindowController.shared.syncVisibility(manager: self)
+        }
+    }
+    @Published var arrowKeyAlignmentEnabled: Bool = true
     @Published var editingDisplays: [DisplayConfig] = []
     @Published var selectedEditingDisplayUUID: String? = nil
     @Published var draggingDisplayUUID: String? = nil
@@ -72,8 +88,11 @@ final class DisplayManager: ObservableObject {
     private var debounceTimer: Timer?
     private var periodicCheckTimer: Timer?
     private var suppressCallbackUntil: Date = .distantPast
+    private var lastDisplayChangeDate: Date = Date()
+    private var bootWindowRestoreDeadline: Date = .distantPast
     private var areSystemScreensAsleep: Bool = false
-    private var pauseWatchdogAfterSleepError: Bool = false
+    private var pauseWatchdogUntil: Date = .distantPast
+    private var lastEditorInteractionDate: Date = .distantPast
     private let storageURL: URL
 
     private init() {
@@ -90,6 +109,8 @@ final class DisplayManager: ObservableObject {
 
         self.autoEnforceLayout = UserDefaults.standard.object(forKey: "autoEnforceLayout") as? Bool ?? true
         self.autoSwitchByHardwareSet = UserDefaults.standard.object(forKey: "autoSwitchByHardwareSet") as? Bool ?? false
+        self.autoRestoreWindowPositions = UserDefaults.standard.object(forKey: "autoRestoreWindowPositions") as? Bool ?? true
+        self.isAccessibilityTrusted = WindowPositionManager.isAccessibilityTrusted()
 
         // Load MonitorPanel private framework for native display rotation support
         _ = dlopen("/System/Library/PrivateFrameworks/MonitorPanel.framework/MonitorPanel", RTLD_LAZY)
@@ -124,6 +145,31 @@ final class DisplayManager: ObservableObject {
         // Immediately check and enforce the saved layout on launch (e.g., right after reboot/login)
         if autoEnforceLayout {
             scheduleCheckAndRestore(delay: 0.5)
+        }
+
+        // ONLY restore windows on app startup if the Mac actually just booted/restarted (systemUptime < 5 minutes).
+        // Relaunching DisplaySaver during normal desktop usage will NOT move any windows.
+        let didMacJustBoot = ProcessInfo.processInfo.systemUptime < 300.0
+        if didMacJustBoot {
+            self.bootWindowRestoreDeadline = Date().addingTimeInterval(90.0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, self.autoRestoreWindowPositions else { return }
+                self.refreshAccessibilityStatus()
+                self.restoreSavedWindowsForActiveProfile(reason: "After Mac restart", silentIfZero: true)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.5) { [weak self] in
+                guard let self, self.autoRestoreWindowPositions else { return }
+                self.restoreSavedWindowsForActiveProfile(reason: "Post-login window restore", silentIfZero: true)
+            }
+        } else {
+            // Normal session launch: just snapshot current window positions if none were saved yet, never move windows!
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self else { return }
+                self.refreshAccessibilityStatus()
+                if self.doesCurrentMatchActiveProfile {
+                    self.captureWindowPositionsForActiveProfile(silent: true)
+                }
+            }
         }
     }
 
@@ -208,6 +254,9 @@ final class DisplayManager: ObservableObject {
             Task { @MainActor in
                 self?.areSystemScreensAsleep = true
                 self?.debounceTimer?.invalidate()
+                if self?.isEditingLayout == true {
+                    self?.cancelEditingLayout()
+                }
             }
         }
 
@@ -219,6 +268,9 @@ final class DisplayManager: ObservableObject {
             Task { @MainActor in
                 self?.areSystemScreensAsleep = true
                 self?.debounceTimer?.invalidate()
+                if self?.isEditingLayout == true {
+                    self?.cancelEditingLayout()
+                }
                 self?.logEvent("Screens went to sleep — pausing display watchdog.")
             }
         }
@@ -230,9 +282,12 @@ final class DisplayManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.areSystemScreensAsleep = false
-                self?.pauseWatchdogAfterSleepError = false
+                self?.pauseWatchdogUntil = .distantPast
+                if self?.isEditingLayout == true {
+                    self?.cancelEditingLayout()
+                }
                 self?.logEvent("System woke from sleep — verifying display layout...")
-                self?.scheduleCheckAndRestore(delay: 2.0)
+                self?.scheduleStagedRestoreChecks(initialDelay: 1.2)
             }
         }
 
@@ -243,14 +298,57 @@ final class DisplayManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.areSystemScreensAsleep = false
-                self?.pauseWatchdogAfterSleepError = false
+                self?.pauseWatchdogUntil = .distantPast
+                if self?.isEditingLayout == true {
+                    self?.cancelEditingLayout()
+                }
                 self?.logEvent("Screens woke — verifying display layout...")
-                self?.scheduleCheckAndRestore(delay: 1.5)
+                self?.scheduleStagedRestoreChecks(initialDelay: 1.0)
             }
         }
 
-        // Also run a lightweight periodic watchdog every 15 seconds in case a monitor silently shifts
-        periodicCheckTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
+        // Snapshot window positions right before macOS restarts or shuts down
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.areSystemScreensAsleep, self.doesCurrentMatchActiveProfile else { return }
+                self.captureWindowPositionsForActiveProfile(silent: true)
+            }
+        }
+
+        // ONLY during the first 90 seconds after a Mac reboot/power-on: as macOS reopens login apps,
+        // move them back to the screen they were on before rebooting. Never fires during normal usage!
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let bundleID = app?.bundleIdentifier
+            Task { @MainActor in
+                guard let self,
+                      Date() < self.bootWindowRestoreDeadline,
+                      self.autoRestoreWindowPositions,
+                      !self.areSystemScreensAsleep,
+                      let bundleID else {
+                    return
+                }
+                guard let savedWins = self.activeProfile?.savedWindows,
+                      savedWins.contains(where: { $0.bundleIdentifier == bundleID }) else {
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self, Date() < self.bootWindowRestoreDeadline else { return }
+                    self.restoreSavedWindowsForActiveProfile(onlyForBundleID: bundleID, reason: "Post-reboot app reopen (\(bundleID))", silentIfZero: true)
+                }
+            }
+        }
+
+        // Run a responsive periodic watchdog every 4 seconds so any refresh rate (e.g. TV 30Hz -> 60Hz) or mirroring drift is auto-corrected immediately
+        periodicCheckTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.periodicWatchdogCheck()
             }
@@ -258,17 +356,37 @@ final class DisplayManager: ObservableObject {
     }
 
     func handleDisplayReconfiguration(display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
-        guard !areSystemScreensAsleep else { return }
+        areSystemScreensAsleep = false
+        lastDisplayChangeDate = Date()
         logEvent("CGReconfig display=\(display) flags=0x\(String(flags.rawValue, radix: 16))")
         // Keep main/monitor displays awake during HDMI/CEC hotplug transitions (e.g. when turning a mirrored TV on or off)
         wakeMainDisplayIfNeeded()
         if flags.contains(.beginConfigurationFlag) {
             return
         }
-        pauseWatchdogAfterSleepError = false
+        pauseWatchdogUntil = .distantPast
+        // If the layout editor was left open unattended (>20s since last click) when hardware reconfigured, auto-close it so we can auto-restore!
+        if isEditingLayout && Date().timeIntervalSince(lastEditorInteractionDate) > 20.0 {
+            cancelEditingLayout()
+        }
         refreshCurrentDisplays()
         guard Date() > suppressCallbackUntil else { return }
-        scheduleCheckAndRestore(delay: 0.5)
+        scheduleStagedRestoreChecks(initialDelay: 0.5)
+    }
+
+    /// Schedules multiple staggered verification passes after wake or HDMI/DisplayPort hotplug so slow-waking TVs/monitors are caught and locked.
+    func scheduleStagedRestoreChecks(initialDelay: TimeInterval = 0.5) {
+        scheduleCheckAndRestore(delay: initialDelay)
+        for extraDelay in [2.2, 5.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + extraDelay) { [weak self] in
+                guard let self, !self.areSystemScreensAsleep, self.autoEnforceLayout, !self.isEditingLayout, !self.isApplying else { return }
+                self.reloadProfilesIfChangedOnDisk()
+                self.refreshCurrentDisplays()
+                if !self.doesCurrentMatchActiveProfile {
+                    self.checkAndRestoreIfNeeded(reason: "Post-wake verification")
+                }
+            }
+        }
     }
 
     private func wakeMainDisplayIfNeeded() {
@@ -302,11 +420,29 @@ final class DisplayManager: ObservableObject {
     }
 
     private func periodicWatchdogCheck() {
-        guard !areSystemScreensAsleep, !pauseWatchdogAfterSleepError else { return }
+        refreshAccessibilityStatus()
+        guard !areSystemScreensAsleep, Date() >= pauseWatchdogUntil else { return }
+        // Auto-exit Edit Layout if it was left open without user interaction for > 90 seconds so auto-restore is never blocked indefinitely
+        if isEditingLayout && Date().timeIntervalSince(lastEditorInteractionDate) > 90.0 {
+            cancelEditingLayout()
+        }
         reloadProfilesIfChangedOnDisk()
         refreshCurrentDisplays()
-        guard autoEnforceLayout, !isApplying, !isEditingLayout, Date() > suppressCallbackUntil else { return }
-        checkAndRestoreIfNeeded(reason: "Watchdog check")
+        guard !isApplying, !isEditingLayout, Date() > suppressCallbackUntil else { return }
+
+        if autoEnforceLayout {
+            checkAndRestoreIfNeeded(reason: "Watchdog check")
+        }
+
+        // Passive recording ONLY (never moves windows!):
+        // When displays are stable and no display changes or boot restores have occurred recently,
+        // quietly record current window positions so we know where everything was if the Mac reboots or screens change.
+        if doesCurrentMatchActiveProfile,
+           Date() > bootWindowRestoreDeadline,
+           Date().timeIntervalSince(lastDisplayChangeDate) > 15.0,
+           Date().timeIntervalSince(lastRestoredDate ?? .distantPast) > 15.0 {
+            recordStableWindowPositionsOnWatchdog()
+        }
     }
 
     func scheduleCheckAndRestore(delay: TimeInterval = 1.0) {
@@ -323,18 +459,12 @@ final class DisplayManager: ObservableObject {
     }
 
     private func checkAndRestoreIfNeeded(reason: String) {
-        guard !areSystemScreensAsleep, !pauseWatchdogAfterSleepError else { return }
+        guard !areSystemScreensAsleep, Date() >= pauseWatchdogUntil else { return }
 
-        // Never attempt to reconfigure displays while any display is asleep!
-        // Calling CGCompleteDisplayConfiguration while screens are asleep blocks for 10s and returns error 1014.
-        var onlineCount: UInt32 = 0
-        if CGGetOnlineDisplayList(0, nil, &onlineCount) == .success, onlineCount > 0 {
-            var ids = [CGDirectDisplayID](repeating: 0, count: Int(onlineCount))
-            if CGGetOnlineDisplayList(onlineCount, &ids, &onlineCount) == .success {
-                if ids.contains(where: { CGDisplayIsAsleep($0) != 0 }) {
-                    return
-                }
-            }
+        // Only defer if the Main display itself is asleep; if so, retry in 2.0s instead of dropping the restore!
+        if CGDisplayIsAsleep(CGMainDisplayID()) != 0 {
+            scheduleCheckAndRestore(delay: 2.0)
+            return
         }
 
         let currentSig = currentDisplays.map { $0.uuid }.sorted()
@@ -534,6 +664,30 @@ final class DisplayManager: ObservableObject {
             return nil
         }
 
+        // Check BEFORE modifying displays whether the desktop screen arrangement/mirroring/bounds actually got switched around!
+        // If all non-mirrored desktop screens are ALREADY in their saved positions and sizes (e.g., only a TV's refresh rate
+        // needed a nudge after waking from sleep), we do NOT touch any app windows!
+        let didScreensSwitchAround: Bool = {
+            for saved in profile.displays where saved.mirrorsUUID == nil {
+                guard let displayID = resolveDisplayID(for: saved) else {
+                    return true
+                }
+                let mirrorTarget = CGDisplayMirrorsDisplay(displayID)
+                if mirrorTarget != kCGNullDirectDisplay && mirrorTarget != displayID {
+                    return true
+                }
+                let bounds = CGDisplayBounds(displayID)
+                let curX = Int32(bounds.origin.x.rounded())
+                let curY = Int32(bounds.origin.y.rounded())
+                let curW = Int(bounds.width.rounded())
+                let curH = Int(bounds.height.rounded())
+                if abs(curX - saved.originX) > 2 || abs(curY - saved.originY) > 2 || abs(curW - saved.width) > 2 || abs(curH - saved.height) > 2 {
+                    return true
+                }
+            }
+            return false
+        }()
+
         // Step 1: Apply rotation changes via MonitorPanel if any display rotation differs
         for saved in profile.displays {
             guard let displayID = resolveDisplayID(for: saved) else { continue }
@@ -617,24 +771,163 @@ final class DisplayManager: ObservableObject {
         if result == .success {
             lastRestoredDate = Date()
             logEvent("Applied setup '\(profile.name)' (Step 1: Layout & Mirroring).")
-            // Step 3: Transaction 2 — After mirroring/unmirroring settles (0.8s), enforce exact modes & origins on all displays!
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            // Step 3: After mirroring/unmirroring settles, enforce exact modes & origins in isolated transactions,
+            // setting Master/Extended modes first (+0.7s) and Mirrored Slave modes (e.g. TV 60Hz) after (+1.4s & +2.8s)!
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
                 self?.enforceDisplayModesPass(for: profile)
             }
         } else {
             CGCancelDisplayConfiguration(config)
             if result.rawValue == 1014 {
-                pauseWatchdogAfterSleepError = true
-                logEvent("Displays are asleep (code 1014) — pausing watchdog until wake.")
+                pauseWatchdogUntil = Date().addingTimeInterval(10.0)
+                logEvent("Displays are asleep (code 1014) — retrying after wake.")
             } else {
                 logEvent("Display configuration returned code \(result.rawValue).")
+                // Still run the isolated per-display mode & mirroring pass in 0.7s in case a combined transaction was rejected
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                    self?.enforceDisplayModesPass(for: profile)
+                }
             }
         }
 
-        // Refresh display snapshot after a short delay to reflect applied state
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshCurrentDisplays()
+        // Refresh display snapshot after a short delay to reflect applied state.
+        // ONLY restore app window positions if the desktop screens actually got switched around!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self else { return }
+            self.refreshCurrentDisplays()
+            if didScreensSwitchAround && self.autoRestoreWindowPositions {
+                self.restoreSavedWindowsForActiveProfile(
+                    reason: "Screens switched around — restored displaced windows",
+                    silentIfZero: true,
+                    onlyMoveCrossScreenDisplaced: true
+                )
+            }
         }
+        if didScreensSwitchAround {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.4) { [weak self] in
+                guard let self, self.autoRestoreWindowPositions else { return }
+                self.restoreSavedWindowsForActiveProfile(
+                    reason: "Screens settled — restored displaced windows",
+                    silentIfZero: true,
+                    onlyMoveCrossScreenDisplaced: true
+                )
+            }
+        }
+    }
+
+    // MARK: - App Window Position Snapshot & Restoration
+
+    func refreshAccessibilityStatus() {
+        let trusted = WindowPositionManager.isAccessibilityTrusted()
+        if isAccessibilityTrusted != trusted {
+            isAccessibilityTrusted = trusted
+        }
+    }
+
+    func requestAccessibilityPermission() {
+        WindowPositionManager.requestAccessibilityPermission()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshAccessibilityStatus()
+        }
+    }
+
+    /// Manually or automatically snapshots all open application window positions into the active setup.
+    func captureWindowPositionsForActiveProfile(silent: Bool = false) {
+        refreshAccessibilityStatus()
+        guard let active = activeProfile,
+              let idx = savedProfiles.firstIndex(where: { $0.id == active.id }) else {
+            return
+        }
+        let currentWins = WindowPositionManager.captureCurrentWindows(displays: currentDisplays)
+        guard !currentWins.isEmpty else {
+            if !silent {
+                logEvent("No open app windows found to snapshot.")
+            }
+            return
+        }
+
+        let existingWins = savedProfiles[idx].savedWindows ?? []
+        let merged = WindowPositionManager.mergeSnapshots(existing: existingWins, current: currentWins)
+        savedProfiles[idx].savedWindows = merged
+        persistProfiles()
+
+        if !silent {
+            let screenCount = Set(currentWins.map { $0.displayUUID }).count
+            logEvent("Saved \(currentWins.count) window position(s) across \(screenCount) screen(s) for '\(active.name)'.")
+        }
+    }
+
+    /// Restores open application windows back to the displays and positions saved in the active setup.
+    func restoreSavedWindowsForActiveProfile(
+        onlyForBundleID: String? = nil,
+        reason: String = "Manual window restore",
+        silentIfZero: Bool = false,
+        onlyMoveCrossScreenDisplaced: Bool = true
+    ) {
+        refreshAccessibilityStatus()
+        guard let active = activeProfile,
+              let savedWins = active.savedWindows,
+              !savedWins.isEmpty else {
+            if !silentIfZero {
+                logEvent("No saved window positions for '\(activeProfile?.name ?? "active setup")' yet.")
+            }
+            return
+        }
+
+        let (movedCount, needsPermission) = WindowPositionManager.restoreWindows(
+            savedWins,
+            displays: currentDisplays,
+            onlyForBundleID: onlyForBundleID,
+            onlyMoveCrossScreenDisplaced: onlyMoveCrossScreenDisplaced
+        )
+
+        if needsPermission {
+            if !silentIfZero {
+                logEvent("Accessibility permission needed to move app windows across screens.")
+                requestAccessibilityPermission()
+            }
+            return
+        }
+
+        if movedCount > 0 {
+            logEvent("\(reason): Restored \(movedCount) app window(s) to their saved screens.")
+        } else if !silentIfZero {
+            logEvent("All open app windows are already on their saved screens.")
+        }
+    }
+
+    private func recordStableWindowPositionsOnWatchdog() {
+        guard let active = activeProfile,
+              let idx = savedProfiles.firstIndex(where: { $0.id == active.id }) else {
+            return
+        }
+        let currentWins = WindowPositionManager.captureCurrentWindows(displays: currentDisplays)
+        guard !currentWins.isEmpty else { return }
+
+        let existingWins = savedProfiles[idx].savedWindows ?? []
+        let merged = WindowPositionManager.mergeSnapshots(existing: existingWins, current: currentWins)
+        if !areWindowSnapshotsApproximatelyEqual(existingWins, merged) {
+            savedProfiles[idx].savedWindows = merged
+            persistProfiles()
+        }
+    }
+
+    private func areWindowSnapshotsApproximatelyEqual(_ a: [SavedWindowPosition], _ b: [SavedWindowPosition]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (w1, w2) in zip(a, b) {
+            if w1.bundleIdentifier != w2.bundleIdentifier ||
+               w1.windowNumber != w2.windowNumber ||
+               w1.isFullScreen != w2.isFullScreen ||
+               w1.displayUUID != w2.displayUUID ||
+               w1.windowTitle != w2.windowTitle ||
+               abs(w1.x - w2.x) > 10 ||
+               abs(w1.y - w2.y) > 10 ||
+               abs(w1.width - w2.width) > 14 ||
+               abs(w1.height - w2.height) > 14 {
+                return false
+            }
+        }
+        return true
     }
 
     private func enforceDisplayModesPass(for profile: DisplayProfile) {
@@ -650,19 +943,64 @@ final class DisplayManager: ObservableObject {
             hwToDisplayID[Self.hardwareID(for: id)] = id
         }
 
-        var needsSecondPass = false
-        var configRef: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&configRef) == .success, let config = configRef else { return }
+        func resolveID(_ saved: DisplayConfig) -> CGDirectDisplayID? {
+            uuidToDisplayID[saved.uuid] ?? hwToDisplayID[saved.hardwareID]
+        }
 
         let sortedForOrigin = profile.displays.sorted { a, b in
             if a.isMain != b.isMain { return a.isMain }
             return false
         }
 
-        for saved in sortedForOrigin {
-            guard let displayID = uuidToDisplayID[saved.uuid] ?? hwToDisplayID[saved.hardwareID] else { continue }
+        // 1. Verify mirroring state first in its own dedicated transaction if any mirrored slave lost mirroring during wake
+        var didFixMirror = false
+        for saved in profile.displays where saved.mirrorsUUID != nil {
+            guard let displayID = resolveID(saved),
+                  let masterUUID = saved.mirrorsUUID,
+                  let masterID = uuidToDisplayID[masterUUID] ?? profile.displays.first(where: { $0.uuid == masterUUID }).flatMap({ resolveID($0) }),
+                  onlineIDs.contains(masterID) else {
+                continue
+            }
+            if CGDisplayMirrorsDisplay(displayID) != masterID {
+                var mConfigRef: CGDisplayConfigRef?
+                if CGBeginDisplayConfiguration(&mConfigRef) == .success, let mConfig = mConfigRef {
+                    CGConfigureDisplayMirrorOfDisplay(mConfig, displayID, masterID)
+                    if CGCompleteDisplayConfiguration(mConfig, .permanently) == .success {
+                        didFixMirror = true
+                        logEvent("Re-locked mirroring for '\(saved.name)'.")
+                    } else {
+                        CGCancelDisplayConfiguration(mConfig)
+                    }
+                }
+            }
+        }
 
-            // Check display mode & refresh rate
+        // 2. Verify origins for non-mirrored displays in a dedicated origin transaction
+        var oConfigRef: CGDisplayConfigRef?
+        if CGBeginDisplayConfiguration(&oConfigRef) == .success, let oConfig = oConfigRef {
+            var needsOriginFix = false
+            for saved in sortedForOrigin where saved.mirrorsUUID == nil {
+                guard let displayID = resolveID(saved) else { continue }
+                let bounds = CGDisplayBounds(displayID)
+                let curX = Int32(bounds.origin.x.rounded())
+                let curY = Int32(bounds.origin.y.rounded())
+                if abs(curX - saved.originX) > 1 || abs(curY - saved.originY) > 1 {
+                    CGConfigureDisplayOrigin(oConfig, displayID, saved.originX, saved.originY)
+                    needsOriginFix = true
+                }
+            }
+            if needsOriginFix {
+                _ = CGCompleteDisplayConfiguration(oConfig, .permanently)
+            } else {
+                CGCancelDisplayConfiguration(oConfig)
+            }
+        }
+
+        // 3. Enforce display modes on NON-MIRRORED (Master & Extended) displays first, each in its own isolated transaction
+        // so one display's mode quirk can never block another display!
+        var didChangeMasterMode = didFixMirror
+        for saved in sortedForOrigin where saved.mirrorsUUID == nil {
+            guard let displayID = resolveID(saved) else { continue }
             let curMode = CGDisplayCopyDisplayMode(displayID)
             let curHz = curMode?.refreshRate ?? 0
             let curW = curMode?.width ?? 0
@@ -672,28 +1010,63 @@ final class DisplayManager: ObservableObject {
 
             if abs(curHz - saved.refreshRate) > 1.0 || curW != saved.width || curH != saved.height || curPxW != saved.pixelWidth || curPxH != saved.pixelHeight {
                 if let bestMode = Self.findBestDisplayMode(for: displayID, matching: saved) {
-                    CGConfigureDisplayWithDisplayMode(config, displayID, bestMode, nil)
-                    needsSecondPass = true
-                }
-            }
-
-            // Also verify origin for non-mirrored displays (especially if a display was just unmirrored in Step 1!)
-            if saved.mirrorsUUID == nil {
-                let bounds = CGDisplayBounds(displayID)
-                let curX = Int32(bounds.origin.x.rounded())
-                let curY = Int32(bounds.origin.y.rounded())
-                if abs(curX - saved.originX) > 1 || abs(curY - saved.originY) > 1 {
-                    CGConfigureDisplayOrigin(config, displayID, saved.originX, saved.originY)
-                    needsSecondPass = true
+                    var dConfigRef: CGDisplayConfigRef?
+                    if CGBeginDisplayConfiguration(&dConfigRef) == .success, let dConfig = dConfigRef {
+                        CGConfigureDisplayWithDisplayMode(dConfig, displayID, bestMode, nil)
+                        let res = CGCompleteDisplayConfiguration(dConfig, .permanently)
+                        if res == .success {
+                            didChangeMasterMode = true
+                        } else {
+                            CGCancelDisplayConfiguration(dConfig)
+                        }
+                    }
                 }
             }
         }
 
-        if needsSecondPass {
-            let res = CGCompleteDisplayConfiguration(config, .permanently)
-            logEvent("Applied Step 2 (Modes & Arrangement) with result \(res.rawValue).")
+        // 4. Enforce display modes on MIRRORED SLAVE displays (e.g. LG TV SSCR2 @ 60Hz).
+        // Because macOS CoreDisplay automatically resets a mirrored slave to 30Hz ~120ms after a master mode/mirror change,
+        // we apply the slave mode in its own transaction (immediately if master didn't change, or +0.55s after master changed,
+        // plus a follow-up lock check at +1.4s).
+        let applyMirroredSlaveModes: @MainActor () -> Void = { [weak self] in
+            guard let self else { return }
+            for saved in profile.displays where saved.mirrorsUUID != nil {
+                guard let displayID = self.onlineDisplayID(for: saved.uuid, hardwareID: saved.hardwareID) else { continue }
+                let curMode = CGDisplayCopyDisplayMode(displayID)
+                let curHz = curMode?.refreshRate ?? 0
+                let curW = curMode?.width ?? 0
+                let curH = curMode?.height ?? 0
+                let curPxW = curMode?.pixelWidth ?? 0
+                let curPxH = curMode?.pixelHeight ?? 0
+
+                if abs(curHz - saved.refreshRate) > 1.0 || curW != saved.width || curH != saved.height || curPxW != saved.pixelWidth || curPxH != saved.pixelHeight {
+                    if let bestMode = Self.findBestDisplayMode(for: displayID, matching: saved) {
+                        var sConfigRef: CGDisplayConfigRef?
+                        if CGBeginDisplayConfiguration(&sConfigRef) == .success, let sConfig = sConfigRef {
+                            CGConfigureDisplayWithDisplayMode(sConfig, displayID, bestMode, nil)
+                            let res = CGCompleteDisplayConfiguration(sConfig, .permanently)
+                            if res == .success {
+                                self.logEvent("Locked '\(saved.name)' to \(Int(bestMode.refreshRate.rounded()))Hz (\(bestMode.width)×\(bestMode.height)).")
+                            } else {
+                                CGCancelDisplayConfiguration(sConfig)
+                            }
+                        }
+                    }
+                }
+            }
+            self.refreshCurrentDisplays()
+        }
+
+        if didChangeMasterMode {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+                applyMirroredSlaveModes()
+            }
         } else {
-            CGCancelDisplayConfiguration(config)
+            applyMirroredSlaveModes()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            applyMirroredSlaveModes()
         }
     }
 
@@ -703,7 +1076,12 @@ final class DisplayManager: ObservableObject {
             return nil
         }
 
-        // 1. Try exact ioDisplayModeID + dimensions + refresh rate match
+        // Helper: true when the mode is a native hardware mode (not a 0x200000 Simulscan mirror-capped 30Hz mode)
+        func isNativeNonSimulscan(_ m: CGDisplayMode) -> Bool {
+            (m.ioFlags & 0x200000) == 0
+        }
+
+        // 1. Try exact ioDisplayModeID + dimensions + refresh rate match (preferring non-Simulscan if target is >= 59Hz)
         if target.ioDisplayModeID != 0,
            let exact = modes.first(where: {
                $0.ioDisplayModeID == target.ioDisplayModeID &&
@@ -716,25 +1094,43 @@ final class DisplayManager: ObservableObject {
             return exact
         }
 
-        // 2. Match logical width/height, pixel width/height (HiDPI), and closest refresh rate
-        let candidates = modes.filter {
+        // 2. Match logical width/height AND target refresh rate first (within 1.5Hz), preferring native non-Simulscan modes
+        // and matching pixelWidth/pixelHeight. This prevents a mirrored TV from getting trapped in 5120x2880@30Hz when 60Hz is 2560x1440!
+        let logicalModes = modes.filter {
             $0.width == target.width &&
             $0.height == target.height &&
-            $0.pixelWidth == target.pixelWidth &&
-            $0.pixelHeight == target.pixelHeight &&
             $0.isUsableForDesktopGUI()
         }
-        if let best = candidates.min(by: { abs($0.refreshRate - target.refreshRate) < abs($1.refreshRate - target.refreshRate) }) {
+
+        if target.refreshRate > 0 {
+            let hzMatched = logicalModes.filter { abs($0.refreshRate - target.refreshRate) <= 1.5 }
+            if !hzMatched.isEmpty {
+                let sortedHz = hzMatched.sorted { a, b in
+                    let aExactPx = (a.pixelWidth == target.pixelWidth && a.pixelHeight == target.pixelHeight)
+                    let bExactPx = (b.pixelWidth == target.pixelWidth && b.pixelHeight == target.pixelHeight)
+                    if aExactPx != bExactPx { return aExactPx }
+                    let aNative = isNativeNonSimulscan(a)
+                    let bNative = isNativeNonSimulscan(b)
+                    if aNative != bNative { return aNative }
+                    return abs(a.refreshRate - target.refreshRate) < abs(b.refreshRate - target.refreshRate)
+                }
+                if let bestHz = sortedHz.first {
+                    return bestHz
+                }
+            }
+        }
+
+        // 3. Fallback: match logical width/height and pixel width/height with closest refresh rate
+        let pxCandidates = logicalModes.filter {
+            $0.pixelWidth == target.pixelWidth &&
+            $0.pixelHeight == target.pixelHeight
+        }
+        if let best = pxCandidates.min(by: { abs($0.refreshRate - target.refreshRate) < abs($1.refreshRate - target.refreshRate) }) {
             return best
         }
 
-        // 3. Fallback: match logical width and height and closest refresh rate
-        let logicalCandidates = modes.filter {
-            $0.width == target.width &&
-            $0.height == target.height &&
-            $0.isUsableForDesktopGUI()
-        }
-        return logicalCandidates.min(by: { abs($0.refreshRate - target.refreshRate) < abs($1.refreshRate - target.refreshRate) })
+        // 4. Final fallback: match logical width and height and closest refresh rate
+        return logicalModes.min(by: { abs($0.refreshRate - target.refreshRate) < abs($1.refreshRate - target.refreshRate) })
     }
 
     private static func setRotation(_ degree: Int32, for displayID: CGDirectDisplayID) {
@@ -862,16 +1258,18 @@ final class DisplayManager: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? suggested : trimmed
 
+        let wins = WindowPositionManager.captureCurrentWindows(displays: currentDisplays)
         let profile = DisplayProfile(
             name: finalName,
             createdAt: Date(),
             updatedAt: Date(),
-            displays: currentDisplays
+            displays: currentDisplays,
+            savedWindows: wins.isEmpty ? nil : wins
         )
         savedProfiles.append(profile)
         activeProfileID = profile.id
         persistProfiles()
-        logEvent("Saved display setup '\(finalName)'.")
+        logEvent("Saved display setup '\(finalName)' (\(wins.count) app windows recorded).")
     }
 
     func saveEditedLayoutAsNewProfile(name: String) {
@@ -885,6 +1283,7 @@ final class DisplayManager: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? suggested : trimmed
 
+        showAlignmentGuide = false
         isEditingLayout = false
         isCreatingProfile = false
         isSavingEditedAsNew = false
@@ -908,11 +1307,34 @@ final class DisplayManager: ObservableObject {
         refreshCurrentDisplays()
         guard let idx = savedProfiles.firstIndex(where: { $0.id == profile.id }) else { return }
         if withCurrentDisplays {
-            savedProfiles[idx].displays = currentDisplays
+            let previousDisplays = savedProfiles[idx].displays
+            var sanitized = currentDisplays
+            // Never accidentally overwrite a display's saved target refresh rate with a lower drifted refresh rate
+            // when clicking Update Active (explicit refresh rate changes are made in Edit Layout & Mirroring).
+            for i in sanitized.indices {
+                if let prev = previousDisplays.first(where: { $0.uuid == sanitized[i].uuid || $0.hardwareID == sanitized[i].hardwareID }),
+                   sanitized[i].refreshRate > 0,
+                   sanitized[i].refreshRate < prev.refreshRate - 1.0,
+                   sanitized[i].width == prev.width,
+                   sanitized[i].height == prev.height {
+                    sanitized[i].refreshRate = prev.refreshRate
+                    sanitized[i].pixelWidth = prev.pixelWidth
+                    sanitized[i].pixelHeight = prev.pixelHeight
+                    sanitized[i].ioDisplayModeID = prev.ioDisplayModeID
+                }
+            }
+            savedProfiles[idx].displays = sanitized
+            let wins = WindowPositionManager.captureCurrentWindows(displays: currentDisplays)
+            if !wins.isEmpty {
+                savedProfiles[idx].savedWindows = WindowPositionManager.mergeSnapshots(
+                    existing: savedProfiles[idx].savedWindows ?? [],
+                    current: wins
+                )
+            }
         }
         savedProfiles[idx].updatedAt = Date()
         persistProfiles()
-        logEvent("Updated setup '\(savedProfiles[idx].name)' with current layout.")
+        logEvent("Updated setup '\(savedProfiles[idx].name)' with current layout & window positions.")
     }
 
     func renameProfile(_ profile: DisplayProfile, to newName: String) {
@@ -931,11 +1353,24 @@ final class DisplayManager: ObservableObject {
 
     func beginEditingLayout(from profile: DisplayProfile? = nil) {
         refreshCurrentDisplays()
+        lastEditorInteractionDate = Date()
         previewingProfileID = nil
         isCreatingProfile = false
         isSavingEditedAsNew = false
         if let profile {
             editingDisplays = profile.displays
+        } else if let active = activeProfile {
+            // Start from the active profile's intended settings for all connected displays so a drifted 30Hz TV
+            // isn't accidentally copied into the editor when tweaking arrangement!
+            var merged: [DisplayConfig] = []
+            for cur in currentDisplays {
+                if let saved = active.displays.first(where: { $0.uuid == cur.uuid || $0.hardwareID == cur.hardwareID }) {
+                    merged.append(saved)
+                } else {
+                    merged.append(cur)
+                }
+            }
+            editingDisplays = merged.isEmpty ? currentDisplays : merged
         } else {
             editingDisplays = currentDisplays
         }
@@ -951,6 +1386,7 @@ final class DisplayManager: ObservableObject {
     }
 
     func cancelEditingLayout() {
+        showAlignmentGuide = false
         isEditingLayout = false
         isCreatingProfile = false
         isSavingEditedAsNew = false
@@ -1059,6 +1495,7 @@ final class DisplayManager: ObservableObject {
     }
 
     func setEditingDisplayResolution(uuid: String, option: DisplayResolutionOption) {
+        lastEditorInteractionDate = Date()
         guard let idx = editingDisplays.firstIndex(where: { $0.uuid == uuid }) else { return }
         editingDisplays[idx].width = option.width
         editingDisplays[idx].height = option.height
@@ -1076,21 +1513,27 @@ final class DisplayManager: ObservableObject {
         if let displayID = onlineDisplayID(for: editingDisplays[idx].uuid, hardwareID: editingDisplays[idx].hardwareID),
            let bestMode = Self.findBestDisplayMode(for: displayID, matching: editingDisplays[idx]) {
             editingDisplays[idx].ioDisplayModeID = bestMode.ioDisplayModeID
+            editingDisplays[idx].pixelWidth = bestMode.pixelWidth
+            editingDisplays[idx].pixelHeight = bestMode.pixelHeight
         }
 
         normalizeEditorOrigins(packHorizontalGaps: true)
     }
 
     func setEditingDisplayRefreshRate(uuid: String, hz: Double) {
+        lastEditorInteractionDate = Date()
         guard let idx = editingDisplays.firstIndex(where: { $0.uuid == uuid }) else { return }
         editingDisplays[idx].refreshRate = hz
         if let displayID = onlineDisplayID(for: editingDisplays[idx].uuid, hardwareID: editingDisplays[idx].hardwareID),
            let bestMode = Self.findBestDisplayMode(for: displayID, matching: editingDisplays[idx]) {
             editingDisplays[idx].ioDisplayModeID = bestMode.ioDisplayModeID
+            editingDisplays[idx].pixelWidth = bestMode.pixelWidth
+            editingDisplays[idx].pixelHeight = bestMode.pixelHeight
         }
     }
 
     func setEditingDisplayRotation(uuid: String, rotation: Double) {
+        lastEditorInteractionDate = Date()
         guard let idx = editingDisplays.firstIndex(where: { $0.uuid == uuid }) else { return }
         let oldRot = Int(editingDisplays[idx].rotation.rounded()) % 360
         let newRot = Int(rotation.rounded()) % 360
@@ -1113,7 +1556,7 @@ final class DisplayManager: ObservableObject {
         }
     }
 
-    /// Moves an extended display directly to the left or right of the Main display in 1 click.
+    /// Moves an extended display directly to the left or right of the Main display in 1 click (preserving any calibrated vertical height offset).
     func placeEditingDisplayHorizontally(uuid: String, placeOnLeft: Bool) {
         guard let idx = editingDisplays.firstIndex(where: { $0.uuid == uuid }) else { return }
         if editingDisplays[idx].mirrorsUUID != nil {
@@ -1128,7 +1571,6 @@ final class DisplayManager: ObservableObject {
                 .map { $0.element.originX }
                 .min() ?? 0
             editingDisplays[idx].originX = minX - Int32(editingDisplays[idx].width)
-            editingDisplays[idx].originY = 0
         } else {
             let maxX = editingDisplays
                 .enumerated()
@@ -1136,9 +1578,65 @@ final class DisplayManager: ObservableObject {
                 .map { $0.element.originX + Int32($0.element.width) }
                 .max() ?? 0
             editingDisplays[idx].originX = maxX
-            editingDisplays[idx].originY = 0
         }
         normalizeEditorOrigins(packHorizontalGaps: true)
+    }
+
+    /// Vertical screen/window alignment offset relative to the Main display:
+    /// Positive (`+Higher ↑`) = pressing Up Arrow moves windows & alignment line UP on this monitor (`originY > 0`)
+    /// Negative (`-Lower ↓`) = pressing Down Arrow moves windows & alignment line DOWN on this monitor (`originY < 0`)
+    func deskHeightOffset(for disp: DisplayConfig) -> Int {
+        let mainY = editingDisplays.first(where: { $0.isMain && $0.mirrorsUUID == nil })?.originY ?? 0
+        return Int(disp.originY - mainY)
+    }
+
+    func setEditingDisplayDeskHeightOffset(uuid: String, higherByPixels: Int) {
+        lastEditorInteractionDate = Date()
+        guard let idx = editingDisplays.firstIndex(where: { $0.uuid == uuid }) else { return }
+        guard !editingDisplays[idx].isMain && editingDisplays[idx].mirrorsUUID == nil else { return }
+        let mainY = editingDisplays.first(where: { $0.isMain && $0.mirrorsUUID == nil })?.originY ?? 0
+        let clamped = min(max(higherByPixels, -600), 600)
+        editingDisplays[idx].originY = mainY + Int32(clamped)
+        normalizeEditorOrigins()
+    }
+
+    func nudgeEditingDisplayDeskHeight(uuid: String, deltaHigherPixels: Int) {
+        guard let disp = editingDisplays.first(where: { $0.uuid == uuid }) else { return }
+        let current = deskHeightOffset(for: disp)
+        setEditingDisplayDeskHeightOffset(uuid: uuid, higherByPixels: current + deltaHigherPixels)
+    }
+
+    /// Moves the active extended display in the layout editor using keyboard arrow keys:
+    /// - Up / Down (`dyHigher`): nudges vertical desk height by 1px (or 10px with Shift)
+    /// - Left / Right (`dx`): moves Left / Right of Main (or nudges horizontal offset when stacked vertically)
+    func handleEditorArrowKey(dx: Int, dyHigher: Int) {
+        guard isEditingLayout && arrowKeyAlignmentEnabled else { return }
+
+        let targetUUID: String
+        if let sel = selectedEditingDisplay, !sel.isMain && sel.mirrorsUUID == nil {
+            targetUUID = sel.uuid
+        } else if let ext = editingDisplays.first(where: { !$0.isMain && $0.mirrorsUUID == nil }) {
+            selectedEditingDisplayUUID = ext.uuid
+            targetUUID = ext.uuid
+        } else {
+            return
+        }
+
+        if dyHigher != 0 {
+            nudgeEditingDisplayDeskHeight(uuid: targetUUID, deltaHigherPixels: dyHigher)
+        }
+
+        if dx != 0, let idx = editingDisplays.firstIndex(where: { $0.uuid == targetUUID }) {
+            let disp = editingDisplays[idx]
+            let mainH = editingDisplays.first(where: { $0.isMain && $0.mirrorsUUID == nil })?.height ?? 1440
+            let isStackedVertically = abs(Int(disp.originY)) >= min(disp.height, mainH) - 50
+            if isStackedVertically {
+                editingDisplays[idx].originX += Int32(dx)
+                normalizeEditorOrigins()
+            } else {
+                placeEditingDisplayHorizontally(uuid: targetUUID, placeOnLeft: dx < 0)
+            }
+        }
     }
 
     func swapLeftRightInEditor() {
@@ -1147,7 +1645,7 @@ final class DisplayManager: ObservableObject {
             .sorted { $0.originX < $1.originX }
         guard nonMirrored.count >= 2 else { return }
 
-        // Reverse the horizontal order of non-mirrored displays while keeping Main anchored at (0, 0)
+        // Reverse the horizontal order of non-mirrored displays while preserving calibrated vertical height offsets
         let reversed = Array(nonMirrored.reversed())
         var currentX: Int32 = 0
         var newXByUUID: [String: Int32] = [:]
@@ -1159,7 +1657,6 @@ final class DisplayManager: ObservableObject {
         for i in editingDisplays.indices {
             if let nx = newXByUUID[editingDisplays[i].uuid] {
                 editingDisplays[i].originX = nx
-                editingDisplays[i].originY = 0
             }
         }
         normalizeEditorOrigins()
@@ -1215,11 +1712,13 @@ final class DisplayManager: ObservableObject {
         let rawX = CGFloat(moved.originX) + deltaDisplayX
         let rawY = CGFloat(moved.originY) + deltaDisplayY
 
-        // Snap to edges of other non-mirrored displays
+        // Snap horizontally to adjacent edges so there are no cursor dead-zones,
+        // while preserving fine vertical height offsets (only snapping Y flush within 16px!).
         let others = editingDisplays.filter { $0.mirrorsUUID == nil && $0.uuid != uuid }
         var bestX = rawX
         var bestY = rawY
-        let snapThreshold: CGFloat = 600
+        let snapXThreshold: CGFloat = 600
+        let snapYFlushThreshold: CGFloat = 16
 
         for other in others {
             let ox = CGFloat(other.originX)
@@ -1229,18 +1728,20 @@ final class DisplayManager: ObservableObject {
             let mw = CGFloat(moved.width)
             let mh = CGFloat(moved.height)
 
-            if abs((rawX + mw) - ox) < snapThreshold {
+            if abs((rawX + mw) - ox) < snapXThreshold {
                 bestX = ox - mw
-                if abs(rawY - oy) < snapThreshold { bestY = oy }
-            } else if abs(rawX - (ox + ow)) < snapThreshold {
+                if abs(rawY - oy) < snapYFlushThreshold { bestY = oy }
+                bestY = min(max(bestY, oy - mh + 200), oy + oh - 200)
+            } else if abs(rawX - (ox + ow)) < snapXThreshold {
                 bestX = ox + ow
-                if abs(rawY - oy) < snapThreshold { bestY = oy }
-            } else if abs((rawY + mh) - oy) < snapThreshold {
+                if abs(rawY - oy) < snapYFlushThreshold { bestY = oy }
+                bestY = min(max(bestY, oy - mh + 200), oy + oh - 200)
+            } else if abs((rawY + mh) - oy) < 300 {
                 bestY = oy - mh
-                if abs(rawX - ox) < snapThreshold { bestX = ox }
-            } else if abs(rawY - (oy + oh)) < snapThreshold {
+                if abs(rawX - ox) < snapXThreshold { bestX = ox }
+            } else if abs(rawY - (oy + oh)) < 300 {
                 bestY = oy + oh
-                if abs(rawX - ox) < snapThreshold { bestX = ox }
+                if abs(rawX - ox) < snapXThreshold { bestX = ox }
             }
         }
 
@@ -1253,6 +1754,7 @@ final class DisplayManager: ObservableObject {
     func saveAndApplyEditedLayout() {
         guard isEditingLayout else { return }
         let updatedDisplays = editingDisplays
+        showAlignmentGuide = false
         isEditingLayout = false
         isCreatingProfile = false
         isSavingEditedAsNew = false
@@ -1279,6 +1781,13 @@ final class DisplayManager: ObservableObject {
             persistProfiles()
             logEvent("Saved setup as '\(suggested)' and applying...")
             applyProfile(profile)
+        }
+
+        // Re-record window coordinates once the updated display origins have settled
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+            guard let self else { return }
+            self.refreshCurrentDisplays()
+            self.captureWindowPositionsForActiveProfile(silent: true)
         }
     }
 
